@@ -1,0 +1,16 @@
+---
+version: '3.3'
+services:
+  annotations:
+    build: .
+    image: komga-annotations-service:latest
+    container_name: komga-annotations
+    environment:
+      - LITELLM_URL=https://ollama.khlloreda.com
+      - LITELLM_API_KEY=${LITELLM_API_KEY}
+      - OCR_MODEL=unlimited-ocr
+      - LLM_MODEL=deepseek-v4-flash
+      - PORT=8787
+    ports:
+      - 8787:8787
+    restart: unless-stopped
