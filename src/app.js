@@ -92,31 +92,12 @@ export function createApp(opts = {}) {
       PRIMARY KEY (book_id, page_number)
     );
   `)
-  // Tabla temporal para el pipeline de 2 fases: guarda el texto OCR de una página
-  // hasta que su traducción (DeepSeek) lo consuma. Permite solapar OCR y traducción.
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS ocr_cache (
-      ocr_id      TEXT PRIMARY KEY,
-      book_id     TEXT NOT NULL,
-      page_number INTEGER NOT NULL,
-      ocr_text    TEXT NOT NULL,
-      created_at  INTEGER NOT NULL
-    );
-  `)
   const stmtGet = db.prepare('SELECT payload FROM annotations WHERE book_id = ? AND page_number = ?')
   const stmtPut = db.prepare(
     'INSERT OR REPLACE INTO annotations (book_id, page_number, payload, created_at) VALUES (?, ?, ?, ?)',
   )
   const stmtCount = db.prepare('SELECT COUNT(*) AS n FROM annotations')
   const stmtPages = db.prepare('SELECT page_number FROM annotations WHERE book_id = ? ORDER BY page_number')
-
-  // OCR cache (pipeline 2 fases)
-  const stmtOcrGet = db.prepare('SELECT ocr_text FROM ocr_cache WHERE ocr_id = ?')
-  const stmtOcrPut = db.prepare(
-    'INSERT OR REPLACE INTO ocr_cache (ocr_id, book_id, page_number, ocr_text, created_at) VALUES (?, ?, ?, ?, ?)',
-  )
-  const stmtOcrDel = db.prepare('DELETE FROM ocr_cache WHERE ocr_id = ?')
-  const stmtOcrCount = db.prepare('SELECT COUNT(*) AS n FROM ocr_cache')
 
   function getStored(bookId, pageNumber) {
     const row = stmtGet.get(String(bookId), Number(pageNumber))
@@ -337,15 +318,6 @@ Reglas:
     res.json({ bookId: String(bookId), pages: rows.map((r) => r.page_number) })
   })
 
-  // GET /api/annotations/:bookId/ocr-status — páginas cuyo OCR ya está listo
-  // (para que el frontend sepa qué puede traducir sin esperar). Definido ANTES
-  // de la ruta genérica :pageNumber para que Express no la capture como página.
-  app.get('/api/annotations/:bookId/ocr-status', (req, res) => {
-    const { bookId } = req.params
-    const rows = db.prepare('SELECT page_number FROM ocr_cache WHERE book_id = ?').all(String(bookId))
-    res.json({ bookId: String(bookId), pages: rows.map((r) => r.page_number) })
-  })
-
   // GET /api/annotations/:bookId/:pageNumber — consulta el store sin imagen
   app.get('/api/annotations/:bookId/:pageNumber', (req, res) => {
     const { bookId, pageNumber } = req.params
@@ -385,68 +357,6 @@ Reglas:
     getOrAnalyze(bookId, pageNumber, image, mimeType)
       .then(() => console.log(`[annotations] PREFETCH done book=${bookId} page=${pageNumber}`))
       .catch((e) => console.error(`[annotations] PREFETCH error book=${bookId} page=${pageNumber}:`, e.message))
-  })
-
-  // ---------------------------------------------------------------------------
-  // Pipeline de 2 fases (paralelizable): OCR y traducción como endpoints separados
-  // ---------------------------------------------------------------------------
-  // POST /api/annotations/ocr — paso 1: extrae el texto con qwen3-omni y lo guarda
-  // en el ocr_cache. Devuelve { ocrId } para que el frontend lo use en /translate.
-  // El OCR es rápido (~4s) y se puede lanzar en paralelo para muchas páginas.
-  app.post('/api/annotations/ocr', async (req, res) => {
-    const { bookId, pageNumber, image, mimeType } = req.body
-    if (!image || bookId == null || pageNumber == null) {
-      return res.status(400).json({ error: 'Missing bookId/pageNumber/image' })
-    }
-    // Si ya está traducida, no hace falta OCR
-    if (getStored(bookId, pageNumber)) {
-      return res.status(200).json({ status: 'already_cached' })
-    }
-    try {
-      const t1 = Date.now()
-      const { ocrText } = await runOcr(image, mimeType)
-      const ocrId = `${String(bookId)}:${Number(pageNumber)}`
-      stmtOcrPut.run(ocrId, String(bookId), Number(pageNumber), ocrText, Date.now())
-      console.log(`[annotations] OCR done in ${Date.now() - t1}ms book=${bookId} page=${pageNumber}`)
-      res.json({ status: 'ok', ocrId })
-    } catch (err) {
-      console.error('[annotations] OCR error:', err.message)
-      res.status(500).json({ error: err.message })
-    }
-  })
-
-  // POST /api/annotations/translate — paso 2: estructura el texto OCR guardado
-  // con deepseek-v4-flash (furigana + kanjis + traducción) y lo persiste.
-  // Devuelve el resultado final (o 404 si el OCR no está listo todavía).
-  app.post('/api/annotations/translate', async (req, res) => {
-    const { bookId, pageNumber, ocrId } = req.body
-    if (bookId == null || pageNumber == null) {
-      return res.status(400).json({ error: 'Missing bookId/pageNumber' })
-    }
-    const id = ocrId || `${String(bookId)}:${Number(pageNumber)}`
-    const row = stmtOcrGet.get(id)
-    if (!row) {
-      return res.status(404).json({ error: 'OCR not ready yet' })
-    }
-    try {
-      const t1 = Date.now()
-      const result = await runDeepSeek(row.ocr_text)
-      stmtOcrDel.run(id)
-      storeResult(bookId, pageNumber, result)
-      console.log(`[annotations] DeepSeek done in ${Date.now() - t1}ms book=${bookId} page=${pageNumber} blocks=${(result.blocks || []).length}`)
-      res.json(result)
-    } catch (err) {
-      console.error('[annotations] translate error:', err.message)
-      res.status(500).json({ error: err.message })
-    }
-  })
-
-  // GET /api/annotations/:bookId/ocr-status — páginas cuyo OCR ya está listo
-  // (para que el frontend sepa qué puede traducir sin esperar).
-  app.get('/api/annotations/:bookId/ocr-status', (req, res) => {
-    const { bookId } = req.params
-    const rows = db.prepare('SELECT page_number FROM ocr_cache WHERE book_id = ?').all(String(bookId))
-    res.json({ bookId: String(bookId), pages: rows.map((r) => r.page_number) })
   })
 
   return { app, db, getStored, storeResult, stmtCount }
