@@ -19,7 +19,6 @@
  */
 import express from 'express'
 import cors from 'cors'
-import sharp from 'sharp'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
@@ -148,6 +147,14 @@ export function createApp(opts = {}) {
    */
   async function resizeImage(imageBase64, mimeType) {
     try {
+      // Carga dinámica de sharp: si el binario nativo no está disponible,
+      // devolvemos la imagen sin redimensionar (el OCR funciona igual).
+      let sharp
+      try {
+        sharp = (await import('sharp')).default
+      } catch {
+        return { base64: imageBase64, mimeType: mimeType || 'image/png', width: 0, height: 0, scaleX: 1, scaleY: 1 }
+      }
       const buf = Buffer.from(imageBase64, 'base64')
       const img = sharp(buf)
       const meta = await img.metadata()
