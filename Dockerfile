@@ -1,8 +1,9 @@
-FROM node:20-slim
+FROM node:20-trixie-slim
 
 WORKDIR /app
 
-# node_modules ya viene precompilado (better-sqlite3 compilado para glibc/Debian).
+# node_modules ya viene precompilado (better-sqlite3 compilado para glibc 2.41/trixie).
+# node:20-trixie-slim tiene glibc 2.41, compatible con el binario compilado.
 # No hacemos npm ci: el build es instantáneo y no supera el timeout del proxy.
 
 COPY node_modules/ ./node_modules/
