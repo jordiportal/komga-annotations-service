@@ -13,4 +13,9 @@ services:
       - PORT=8787
     ports:
       - 8787:8787
+    volumes:
+      - annotations-data:/app/data
     restart: unless-stopped
+
+volumes:
+  annotations-data:
