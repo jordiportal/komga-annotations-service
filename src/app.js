@@ -1,7 +1,9 @@
 /**
  * Komga Annotations Service — aplicación Express (testeable)
  *
- * Pipeline: imagen de página → qwen3-omni (OCR + furigana + kanjis en UN solo paso)
+ * Pipeline (2 pasos):
+ *   1. OCR con qwen3-omni: extrae el texto plano de la página (rápido).
+ *   2. Estructuración con deepseek-v4-flash: furigana + kanjis + traducción.
  *
  * Este módulo expone `createApp()` con dependencias inyectables para poder testear
  * el servicio sin arrancar un servidor real ni llamar a la API de LiteLLM.
@@ -176,12 +178,35 @@ export function createApp(opts = {}) {
   }
 
   /**
-   * Paso único: qwen3-omni hace OCR + estructuración (furigana + kanjis) en una sola llamada.
-   * Recibe la imagen directamente y devuelve el JSON estructurado.
+   * Paso 1 — OCR: qwen3-omni extrae el texto plano de la página (rápido).
+   * Recibe la imagen y devuelve el texto japonés en orden de lectura.
    */
   async function runOcr(imageBase64, mimeType) {
     const resized = await resizeImage(imageBase64, mimeType)
-    const system = `Eres un asistente experto en japonés. Recibes la imagen de una página de manga.
+    const system = `Eres un motor de OCR especializado en japonés. Recibes la imagen de una página de manga.
+
+Debes transcribir TODO el texto que aparece en la imagen, en orden de lectura (derecha a izquierda, arriba a abajo).
+
+Reglas:
+- Transcribe exactamente el texto tal y como aparece, sin añadir ni corregir nada.
+- Separa cada globo de diálogo o párrafo coherente con un salto de línea.
+- No traduzcas, no añadas furigana, no expliques nada: SOLO transcribe el texto japonés.
+- Si no hay texto, responde con una línea vacía.`
+
+    const content = [
+      { type: 'text', text: system },
+      { type: 'image_url', image_url: { url: `data:${resized.mimeType};base64,${resized.base64}` } },
+    ]
+    const raw = await callLiteLLM(ocrModel, [{ role: 'user', content }], { maxTokens: 2048, temperature: 0.1 })
+    return { ocrText: raw.trim(), scaleX: resized.scaleX, scaleY: resized.scaleY }
+  }
+
+  /**
+   * Paso 2 — Estructuración: deepseek-v4-flash recibe el texto OCR y añade
+   * furigana + kanjis + traducción al español. Devuelve el JSON estructurado.
+   */
+  async function runDeepSeek(ocrText) {
+    const system = `Eres un asistente experto en japonés. Recibes el texto OCR de una página de manga (un bloque por línea).
 
 Debes responder SOLO con JSON válido, sin markdown ni comentarios, con esta estructura:
 {
@@ -199,38 +224,35 @@ Debes responder SOLO con JSON válido, sin markdown ni comentarios, con esta est
 }
 
 Reglas:
-- Lee el texto de la página en orden de lectura (derecha a izquierda, arriba a abajo).
-- Divide el texto en bloques lógicos (cada globo de diálogo o párrafo coherente es un bloque).
+- Divide el texto en bloques lógicos (cada línea/globo de diálogo es un bloque).
 - "bbox" déjalo en [0,0,0,0] (no se usa para posicionar, el panel es lateral).
 - "furigana": para cada kanji añade su lectura en hiragana entre paréntesis justo después.
 - "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado.
 - "translation": traducción natural y breve al español.
 - Si un bloque no tiene kanjis, "kanji" será un array vacío.
-- No inventes texto: usa exactamente el que aparece en la imagen.`
+- No inventes texto: usa exactamente el que recibes. Si el OCR tiene errores evidentes, corrígelos con criterio.`
 
-    const content = [
-      { type: 'text', text: system },
-      { type: 'image_url', image_url: { url: `data:${resized.mimeType};base64,${resized.base64}` } },
-    ]
-    const raw = await callLiteLLM(ocrModel, [{ role: 'user', content }], { maxTokens: 4096, temperature: 0.1 })
+    const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto OCR:\n' + ocrText }], { maxTokens: 4096, temperature: 0.1 })
 
     const jsonMatch = raw.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) throw new Error(`qwen3-omni no devolvió JSON válido: ${raw.slice(0, 300)}`)
-    const result = JSON.parse(jsonMatch[0])
-    return { ocrText: '', scaleX: resized.scaleX, scaleY: resized.scaleY, result }
+    if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
+    return JSON.parse(jsonMatch[0])
   }
 
   /**
-   * Analiza una página completa (qwen3-omni en un solo paso) y devuelve el resultado.
+   * Analiza una página completa (OCR + estructuración) y devuelve el resultado.
    * Escala los bbox de vuelta a las coordenadas de la imagen original.
    */
   async function analyzePage(imageBase64, mimeType) {
     const t1 = Date.now()
-    const { ocrText, scaleX, scaleY, result } = await runOcr(imageBase64, mimeType)
+    const { ocrText, scaleX, scaleY } = await runOcr(imageBase64, mimeType)
     const t2 = Date.now()
-    console.log(`[annotations] qwen3-omni done in ${t2 - t1}ms, blocks=${(result.blocks || []).length}`)
+    console.log(`[annotations] OCR done in ${t2 - t1}ms`)
+    const result = await runDeepSeek(ocrText)
+    const t3 = Date.now()
+    console.log(`[annotations] DeepSeek done in ${t3 - t2}ms, blocks=${(result.blocks || []).length}`)
     if (!result.blocks || result.blocks.length === 0) {
-      console.warn('[annotations] WARNING: qwen3-omni devolvió 0 bloques')
+      console.warn('[annotations] WARNING: deepseek devolvió 0 bloques')
     }
 
     const invX = 1 / (scaleX || 1)
@@ -286,7 +308,7 @@ Reglas:
   }
 
   app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', model: ocrModel, stored: stmtCount.get().n })
+    res.json({ status: 'ok', ocrModel, llmModel, stored: stmtCount.get().n })
   })
 
   // GET /api/annotations/:bookId/status — páginas ya traducidas de un libro
