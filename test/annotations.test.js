@@ -15,7 +15,7 @@ const PNG_1x1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8
 // PNG 1x1 distinto (rojo) — para forzar análisis real en el prefetch (evita cache hit por hash de imagen)
 const PNG_1x1_RED = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 
-// Resultado JSON que devolverá el "DeepSeek" mockeado
+// Resultado JSON que devolverá el "qwen3-omni" mockeado (un solo paso: OCR + estructuración)
 const MOCK_RESULT = {
   blocks: [
     {
@@ -35,9 +35,6 @@ function makeMockLiteLLM() {
     fn: async (model, messages, opts) => {
       calls.push({ model, messages, opts })
       if (model === 'qwen3-omni') {
-        return 'こんにちは世界'
-      }
-      if (model === 'deepseek-v4-flash') {
         return JSON.stringify(MOCK_RESULT)
       }
       throw new Error(`Unexpected model ${model}`)
@@ -68,13 +65,12 @@ describe('Komga Annotations Service', () => {
     appCtx.db.close()
   })
 
-  test('GET /health devuelve ok y modelos', async () => {
+  test('GET /health devuelve ok y modelo', async () => {
     const res = await fetch(`${baseUrl}/health`)
     assert.equal(res.status, 200)
     const body = await res.json()
     assert.equal(body.status, 'ok')
-    assert.equal(body.ocrModel, 'qwen3-omni')
-    assert.equal(body.llmModel, 'deepseek-v4-flash')
+    assert.equal(body.model, 'qwen3-omni')
   })
 
   test('POST /api/annotations analiza una página y devuelve blocks', async () => {
@@ -88,8 +84,9 @@ describe('Komga Annotations Service', () => {
     assert.ok(Array.isArray(body.blocks))
     assert.equal(body.blocks.length, 1)
     assert.equal(body.blocks[0].furigana, 'こんにちは世界(せかい)')
-    // Debe haber llamado a OCR y a DeepSeek
-    assert.equal(mock.calls.length, 2)
+    // Debe haber llamado a qwen3-omni (un solo paso)
+    assert.equal(mock.calls.length, 1)
+    assert.equal(mock.calls[0].model, 'qwen3-omni')
   })
 
   test('POST /api/annotations con la misma página devuelve del STORE (sin llamar al LLM)', async () => {
@@ -139,11 +136,11 @@ describe('Komga Annotations Service', () => {
     const body = await res.json()
     assert.equal(body.status, 'queued')
 
-    // Esperar a que el background termine
-    for (let i = 0; i < 50 && mock.calls.length < callsBefore + 2; i++) {
+    // Esperar a que el background termine (1 llamada a qwen3-omni)
+    for (let i = 0; i < 50 && mock.calls.length < callsBefore + 1; i++) {
       await new Promise((r) => setTimeout(r, 50))
     }
-    assert.ok(mock.calls.length >= callsBefore + 2, 'el prefetch debería haber llamado al LLM')
+    assert.ok(mock.calls.length >= callsBefore + 1, 'el prefetch debería haber llamado al LLM')
 
     // Ahora la página está en el store
     const storedRes = await fetch(`${baseUrl}/api/annotations/b2/5`)
@@ -170,7 +167,7 @@ describe('Komga Annotations Service', () => {
 
   test('el LLM que devuelve JSON inválido produce 500', async () => {
     const badCtx = createApp({
-      callLiteLLM: async (model) => (model === 'qwen3-omni' ? 'texto' : 'esto no es json'),
+      callLiteLLM: async (model) => (model === 'qwen3-omni' ? 'esto no es json' : ''),
       ocrModel: 'qwen3-omni',
       llmModel: 'deepseek-v4-flash',
     })

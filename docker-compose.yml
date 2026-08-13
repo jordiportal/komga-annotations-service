@@ -9,7 +9,6 @@ services:
       - LITELLM_URL=https://ollama.khlloreda.com
       - LITELLM_API_KEY=${LITELLM_API_KEY}
       - OCR_MODEL=qwen3-omni
-      - LLM_MODEL=deepseek-v4-flash
       - PORT=8787
     ports:
       - 8787:8787

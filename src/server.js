@@ -16,5 +16,5 @@ const { app } = createApp({
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[annotations] listening on http://0.0.0.0:${PORT}`)
-  console.log(`[annotations] LiteLLM: ${process.env.LITELLM_URL || 'https://ollama.khlloreda.com'} | OCR: ${process.env.OCR_MODEL || 'qwen3-omni'} | LLM: ${process.env.LLM_MODEL || 'deepseek-v4-flash'} | PREFETCH_COUNT: ${process.env.PREFETCH_COUNT || 3}`)
+  console.log(`[annotations] LiteLLM: ${process.env.LITELLM_URL || 'https://ollama.khlloreda.com'} | Modelo: ${process.env.OCR_MODEL || 'qwen3-omni'} | PREFETCH_COUNT: ${process.env.PREFETCH_COUNT || 3}`)
 })
