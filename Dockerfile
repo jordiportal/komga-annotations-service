@@ -1,17 +1,13 @@
-FROM node:20-alpine
+FROM node:20-slim
 
 WORKDIR /app
 
-# better-sqlite3 no tiene binarios precompilados para Alpine/musl:
-# necesita compilarse con node-gyp (python3, make, g++).
-# Instalamos las herramientas de build, compilamos y las limpiamos.
-RUN apk add --no-cache --virtual .build-deps python3 make g++ \
-    && apk add --no-cache sqlite
+# better-sqlite3 tiene binarios precompilados para glibc (Debian),
+# así que npm ci no necesita compilar nada (a diferencia de Alpine/musl).
 
 # Copiar package.json y lockfile primero para cachear capas de dependencias
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev \
-    && apk del .build-deps
+RUN npm ci --omit=dev
 
 # Copiar el código fuente
 COPY src/ ./src/
