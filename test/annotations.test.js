@@ -193,4 +193,89 @@ describe('Komga Annotations Service', () => {
       badCtx.db.close()
     }
   })
+
+  // ---------------------------------------------------------------------------
+  // Pipeline de 2 fases (paralelizable): /ocr y /translate
+  // ---------------------------------------------------------------------------
+  test('POST /api/annotations/ocr extrae texto y lo guarda (solo qwen3-omni)', async () => {
+    const callsBefore = mock.calls.length
+    const res = await fetch(`${baseUrl}/api/annotations/ocr`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b3', pageNumber: 1, image: PNG_1x1_RED, mimeType: 'image/png' }),
+    })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.status, 'ok')
+    assert.equal(body.ocrId, 'b3:1')
+    // Solo debe haber llamado a qwen3-omni (OCR), NO a deepseek todavía
+    assert.equal(mock.calls.length, callsBefore + 1)
+    assert.equal(mock.calls[mock.calls.length - 1].model, 'qwen3-omni')
+  })
+
+  test('POST /api/annotations/translate estructura el OCR guardado (solo deepseek)', async () => {
+    // Autocontenido: primero hacemos el OCR de una página nueva, luego la traducimos.
+    const ocrRes = await fetch(`${baseUrl}/api/annotations/ocr`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b4', pageNumber: 2, image: PNG_1x1_RED, mimeType: 'image/png' }),
+    })
+    assert.equal(ocrRes.status, 200)
+
+    const callsBefore = mock.calls.length
+    const res = await fetch(`${baseUrl}/api/annotations/translate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b4', pageNumber: 2 }),
+    })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.ok(Array.isArray(body.blocks))
+    assert.equal(body.blocks[0].furigana, 'こんにちは世界(せかい)')
+    // Solo deepseek (estructuración), no qwen3-omni
+    assert.equal(mock.calls.length, callsBefore + 1)
+    assert.equal(mock.calls[mock.calls.length - 1].model, 'deepseek-v4-flash')
+    // Tras traducir, la página queda en el store
+    const stored = await fetch(`${baseUrl}/api/annotations/b4/2`)
+    assert.equal(stored.status, 200)
+  })
+
+  test('POST /api/annotations/translate sin OCR previo devuelve 404', async () => {
+    const res = await fetch(`${baseUrl}/api/annotations/translate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b3', pageNumber: 999 }),
+    })
+    assert.equal(res.status, 404)
+    const body = await res.json()
+    assert.equal(body.error, 'OCR not ready yet')
+  })
+
+  test('GET /api/annotations/:bookId/ocr-status lista páginas con OCR listo', async () => {
+    // Hacemos un OCR que NO se traduce, para que quede pendiente en el ocr_cache
+    await fetch(`${baseUrl}/api/annotations/ocr`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b5', pageNumber: 7, image: PNG_1x1_RED, mimeType: 'image/png' }),
+    })
+    const res = await fetch(`${baseUrl}/api/annotations/b5/ocr-status`)
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.bookId, 'b5')
+    assert.ok(body.pages.includes(7), 'debería listar la página 7 con OCR listo')
+  })
+
+  test('POST /api/annotations/ocr en página ya traducida devuelve already_cached', async () => {
+    const callsBefore = mock.calls.length
+    const res = await fetch(`${baseUrl}/api/annotations/ocr`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b4', pageNumber: 2, image: PNG_1x1, mimeType: 'image/png' }),
+    })
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.status, 'already_cached')
+    // No debe llamar al LLM (ya traducida)
+    assert.equal(mock.calls.length, callsBefore)
+  })
 })
