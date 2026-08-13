@@ -2,15 +2,12 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# better-sqlite3 tiene binarios precompilados para glibc (Debian),
-# así que npm ci no necesita compilar nada (a diferencia de Alpine/musl).
+# node_modules ya viene precompilado (better-sqlite3 compilado para glibc/Debian).
+# No hacemos npm ci: el build es instantáneo y no supera el timeout del proxy.
 
-# Copiar package.json y lockfile primero para cachear capas de dependencias
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
-
-# Copiar el código fuente
+COPY node_modules/ ./node_modules/
 COPY src/ ./src/
+COPY package.json package-lock.json ./
 
 ENV NODE_ENV=production
 ENV PORT=8787
