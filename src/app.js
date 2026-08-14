@@ -98,6 +98,32 @@ export function createApp(opts = {}) {
   const stmtCount = db.prepare('SELECT COUNT(*) AS n FROM annotations')
   const stmtPages = db.prepare('SELECT page_number FROM annotations WHERE book_id = ? ORDER BY page_number')
 
+  // --- Jobs de traducción (traducir todo el manga) ---
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS translation_jobs (
+      id           TEXT PRIMARY KEY,
+      book_id      TEXT NOT NULL,
+      type         TEXT NOT NULL,
+      status       TEXT NOT NULL DEFAULT 'pending',
+      start_page   INTEGER NOT NULL,
+      end_page     INTEGER NOT NULL,
+      total_pages  INTEGER NOT NULL,
+      done_pages   INTEGER NOT NULL DEFAULT 0,
+      failed_pages INTEGER NOT NULL DEFAULT 0,
+      created_at   INTEGER NOT NULL,
+      updated_at   INTEGER NOT NULL
+    );
+  `)
+  const stmtJobInsert = db.prepare(`
+    INSERT INTO translation_jobs (id, book_id, type, status, start_page, end_page, total_pages, done_pages, failed_pages, created_at, updated_at)
+    VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, 0, ?, ?)
+  `)
+  const stmtJobGet = db.prepare('SELECT * FROM translation_jobs WHERE id = ?')
+  const stmtJobUpdate = db.prepare(
+    'UPDATE translation_jobs SET done_pages = ?, failed_pages = ?, status = ?, updated_at = ? WHERE id = ?',
+  )
+  const stmtJobList = db.prepare('SELECT * FROM translation_jobs WHERE book_id = ? ORDER BY created_at DESC')
+
   function getStored(bookId, pageNumber) {
     const row = stmtGet.get(String(bookId), Number(pageNumber))
     return row ? JSON.parse(row.payload) : null
@@ -247,15 +273,83 @@ Reglas:
   }
 
   /**
-   * Analiza una página completa (OCR + estructuración) y devuelve el resultado.
+   * Pipeline "quality" — qwen3-omni en UN SOLO paso: OCR + furigana + kanjis + traducción.
+   * Más lento por página pero de mayor calidad (un solo modelo entiende el contexto completo).
+   */
+  async function runQwenOnly(imageBase64, mimeType) {
+    const resized = await resizeImage(imageBase64, mimeType)
+    const system = `Eres un asistente experto en japonés y OCR de manga. Recibes la imagen de una página de manga.
+
+Debes transcribir TODO el texto en orden de lectura (derecha a izquierda, arriba a abajo) y, para cada bloque, añadir furigana, traducción al español y los kanjis difíciles.
+
+Responde SOLO con JSON válido, sin markdown ni comentarios, con esta estructura:
+{
+  "blocks": [
+    {
+      "bbox": [0, 0, 0, 0],
+      "original": "texto japonés original (un párrafo o globo de diálogo)",
+      "furigana": "texto con lectura en furigana: 漢字(かんじ) para cada kanji",
+      "translation": "traducción breve al español",
+      "kanji": [
+        { "kanji": "漢字", "reading": "かんじ", "meaning": "significado en español" }
+      ]
+    }
+  ]
+}
+
+Reglas:
+- Divide el texto en bloques lógicos (cada globo de diálogo o párrafo coherente es un bloque).
+- "bbox" déjalo en [0,0,0,0] (no se usa para posicionar, el panel es lateral).
+- "furigana": para cada kanji añade su lectura en hiragana entre paréntesis justo después.
+- "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado.
+- "translation": traducción natural y breve al español.
+- Si un bloque no tiene kanjis, "kanji" será un array vacío.
+- No inventes texto: usa exactamente el que recibes. Si el OCR tiene errores evidentes, corrígelos con criterio.`
+
+    const content = [
+      { type: 'text', text: system },
+      { type: 'image_url', image_url: { url: `data:${resized.mimeType};base64,${resized.base64}` } },
+    ]
+    const raw = await callLiteLLM(ocrModel, [{ role: 'user', content }], { maxTokens: 4096, temperature: 0.1 })
+
+    const jsonMatch = raw.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) throw new Error(`${ocrModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
+    const result = JSON.parse(jsonMatch[0])
+
+    const invX = 1 / (resized.scaleX || 1)
+    const invY = 1 / (resized.scaleY || 1)
+    for (const block of (result.blocks || [])) {
+      if (Array.isArray(block.bbox) && block.bbox.length === 4) {
+        block.bbox = [
+          Math.round(block.bbox[0] * invX),
+          Math.round(block.bbox[1] * invY),
+          Math.round(block.bbox[2] * invX),
+          Math.round(block.bbox[3] * invY),
+        ]
+      }
+    }
+    return result
+  }
+
+  /**
+   * Analiza una página completa y devuelve el resultado.
+   * `type` selecciona el pipeline:
+   *   - 'fast'   (por defecto): OCR qwen3-omni → estructuración deepseek-v4-flash (2 pasos, rápido)
+   *   - 'quality': qwen3-omni en un solo paso (OCR + furigana + kanjis + traducción)
    * Escala los bbox de vuelta a las coordenadas de la imagen original.
    */
-  async function analyzePage(imageBase64, mimeType) {
+  async function analyzePage(imageBase64, mimeType, type = 'fast') {
     const t1 = Date.now()
+    let result
+    if (type === 'quality') {
+      result = await runQwenOnly(imageBase64, mimeType)
+      console.log(`[annotations] qwen-only done in ${Date.now() - t1}ms, blocks=${(result.blocks || []).length}`)
+      return result
+    }
     const { ocrText, scaleX, scaleY } = await runOcr(imageBase64, mimeType)
     const t2 = Date.now()
     console.log(`[annotations] OCR done in ${t2 - t1}ms`)
-    const result = await runDeepSeek(ocrText)
+    result = await runDeepSeek(ocrText)
     const t3 = Date.now()
     console.log(`[annotations] DeepSeek done in ${t3 - t2}ms, blocks=${(result.blocks || []).length}`)
     if (!result.blocks || result.blocks.length === 0) {
@@ -281,7 +375,7 @@ Reglas:
    * Obtiene las anotaciones de una página, usando store → caché → análisis.
    * Si hay que analizar, guarda el resultado en el store y en la caché.
    */
-  async function getOrAnalyze(bookId, pageNumber, imageBase64, mimeType) {
+  async function getOrAnalyze(bookId, pageNumber, imageBase64, mimeType, type = 'fast') {
     const t0 = Date.now()
 
     // 1) Store persistente (SQLite)
@@ -301,7 +395,7 @@ Reglas:
     }
 
     // 3) Análisis completo
-    const result = await analyzePage(imageBase64, mimeType)
+    const result = await analyzePage(imageBase64, mimeType, type)
 
     if (annotationCache.size >= CACHE_MAX) {
       const firstKey = annotationCache.keys().next().value
@@ -316,6 +410,78 @@ Reglas:
 
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', ocrModel, llmModel, stored: stmtCount.get().n })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Jobs de traducción (traducir todo el manga)
+  // NOTA: estas rutas deben definirse ANTES de /api/annotations/:bookId/:pageNumber
+  // para que Express no las capture como bookId='jobs'.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Procesa un job de traducción en background: recorre las páginas del rango y
+   * las analiza con el pipeline indicado, actualizando el progreso en SQLite.
+   *
+   * El job NO recibe las imágenes (el frontend las orquesta): el frontend va
+   * enviando cada página vía POST /api/annotations (que ya cachea en el store),
+   * y el job solo hace seguimiento del progreso. Esto evita que el backend tenga
+   * que descargar las imágenes del libro (no conoce la URL del servidor Komga).
+   */
+  function startTranslationJob(jobId) {
+    // El progreso real lo reporta el frontend al ir traduciendo cada página.
+    // Este worker solo marca el job como 'running' y queda a la espera de que el
+    // frontend vaya actualizando done_pages vía PATCH /api/annotations/jobs/:id.
+    const row = stmtJobGet.get(jobId)
+    if (!row) return
+    stmtJobUpdate.run(row.done_pages, row.failed_pages, 'running', Date.now(), jobId)
+  }
+
+  // POST /api/annotations/jobs — crea un job de traducción
+  app.post('/api/annotations/jobs', (req, res) => {
+    const { bookId, type, startPage, endPage } = req.body
+    if (bookId == null || startPage == null || endPage == null) {
+      return res.status(400).json({ error: 'Missing bookId/startPage/endPage' })
+    }
+    if (type !== 'fast' && type !== 'quality') {
+      return res.status(400).json({ error: 'type must be "fast" or "quality"' })
+    }
+    if (endPage < startPage) {
+      return res.status(400).json({ error: 'endPage must be >= startPage' })
+    }
+    const jobId = crypto.randomUUID()
+    const now = Date.now()
+    const total = endPage - startPage + 1
+    stmtJobInsert.run(jobId, String(bookId), type, startPage, endPage, total, now, now)
+    startTranslationJob(jobId)
+    res.status(201).json(stmtJobGet.get(jobId))
+  })
+
+  // GET /api/annotations/jobs/:id — estado de un job
+  app.get('/api/annotations/jobs/:id', (req, res) => {
+    const row = stmtJobGet.get(req.params.id)
+    if (!row) return res.status(404).json({ error: 'Job not found' })
+    res.json(row)
+  })
+
+  // PATCH /api/annotations/jobs/:id — actualiza el progreso de un job
+  // body: { donePages?, failedPages?, status? }
+  app.patch('/api/annotations/jobs/:id', (req, res) => {
+    const row = stmtJobGet.get(req.params.id)
+    if (!row) return res.status(404).json({ error: 'Job not found' })
+    const { donePages, failedPages, status } = req.body
+    const newDone = donePages != null ? Number(donePages) : row.done_pages
+    const newFailed = failedPages != null ? Number(failedPages) : row.failed_pages
+    const newStatus = status || row.status
+    stmtJobUpdate.run(newDone, newFailed, newStatus, Date.now(), row.id)
+    res.json(stmtJobGet.get(row.id))
+  })
+
+  // GET /api/annotations/jobs?bookId=... — lista jobs de un libro
+  app.get('/api/annotations/jobs', (req, res) => {
+    const { bookId } = req.query
+    if (!bookId) return res.status(400).json({ error: 'Missing bookId query param' })
+    const rows = stmtJobList.all(String(bookId))
+    res.json({ bookId: String(bookId), jobs: rows })
   })
 
   // GET /api/annotations/:bookId/status — páginas ya traducidas de un libro
@@ -335,13 +501,14 @@ Reglas:
 
   // POST /api/annotations — analiza (o devuelve del store) una página
   app.post('/api/annotations', async (req, res) => {
-    const { bookId, pageNumber, image, mimeType } = req.body
+    const { bookId, pageNumber, image, mimeType, type } = req.body
     if (!image) return res.status(400).json({ error: 'Missing "image" (base64) in body' })
     if (bookId == null || pageNumber == null) {
       return res.status(400).json({ error: 'Missing "bookId" or "pageNumber" in body' })
     }
+    const pipelineType = type === 'quality' ? 'quality' : 'fast'
     try {
-      const { result } = await getOrAnalyze(bookId, pageNumber, image, mimeType)
+      const { result } = await getOrAnalyze(bookId, pageNumber, image, mimeType, pipelineType)
       res.json(result)
     } catch (err) {
       console.error('[annotations] error:', err.message)

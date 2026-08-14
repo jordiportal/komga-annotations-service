@@ -35,6 +35,13 @@ function makeMockLiteLLM() {
     fn: async (model, messages, opts) => {
       calls.push({ model, messages, opts })
       if (model === 'qwen3-omni') {
+        // Si la petición incluye una imagen (content con image_url) → modo quality (JSON)
+        // Si es solo texto → paso 1 OCR (texto plano)
+        const content = messages?.[0]?.content
+        const hasImage = Array.isArray(content) && content.some((c) => c.type === 'image_url')
+        if (hasImage) {
+          return JSON.stringify(MOCK_RESULT)
+        }
         // Paso 1 (OCR): devuelve texto plano
         return 'こんにちは世界\n'
       }
@@ -191,6 +198,132 @@ describe('Komga Annotations Service', () => {
     } finally {
       await new Promise((resolve) => badServer.close(resolve))
       badCtx.db.close()
+    }
+  })
+
+  // ---------------------------------------------------------------------------
+  // Jobs de traducción
+  // ---------------------------------------------------------------------------
+
+  test('POST /api/annotations/jobs crea un job y lo devuelve', async () => {
+    const res = await fetch(`${baseUrl}/api/annotations/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b1', type: 'fast', startPage: 1, endPage: 10 }),
+    })
+    assert.equal(res.status, 201)
+    const job = await res.json()
+    assert.ok(job.id)
+    assert.equal(job.book_id, 'b1')
+    assert.equal(job.type, 'fast')
+    assert.equal(job.status, 'running')
+    assert.equal(job.total_pages, 10)
+    assert.equal(job.start_page, 1)
+    assert.equal(job.end_page, 10)
+  })
+
+  test('POST /api/annotations/jobs valida type', async () => {
+    const res = await fetch(`${baseUrl}/api/annotations/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b1', type: 'invalid', startPage: 1, endPage: 10 }),
+    })
+    assert.equal(res.status, 400)
+  })
+
+  test('GET /api/annotations/jobs/:id devuelve el estado del job', async () => {
+    const createRes = await fetch(`${baseUrl}/api/annotations/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b1', type: 'quality', startPage: 1, endPage: 5 }),
+    })
+    const created = await createRes.json()
+    const res = await fetch(`${baseUrl}/api/annotations/jobs/${created.id}`)
+    assert.equal(res.status, 200)
+    const job = await res.json()
+    assert.equal(job.id, created.id)
+    assert.equal(job.type, 'quality')
+    assert.equal(job.total_pages, 5)
+  })
+
+  test('GET /api/annotations/jobs/:id devuelve 404 si no existe', async () => {
+    const res = await fetch(`${baseUrl}/api/annotations/jobs/nonexistent`)
+    assert.equal(res.status, 404)
+  })
+
+  test('PATCH /api/annotations/jobs/:id actualiza el progreso', async () => {
+    const createRes = await fetch(`${baseUrl}/api/annotations/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bookId: 'b1', type: 'fast', startPage: 1, endPage: 10 }),
+    })
+    const created = await createRes.json()
+
+    const patchRes = await fetch(`${baseUrl}/api/annotations/jobs/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ donePages: 4, failedPages: 1 }),
+    })
+    assert.equal(patchRes.status, 200)
+    const job = await patchRes.json()
+    assert.equal(job.done_pages, 4)
+    assert.equal(job.failed_pages, 1)
+
+    // Completar
+    const doneRes = await fetch(`${baseUrl}/api/annotations/jobs/${created.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ donePages: 10, status: 'completed' }),
+    })
+    const done = await doneRes.json()
+    assert.equal(done.done_pages, 10)
+    assert.equal(done.status, 'completed')
+  })
+
+  test('GET /api/annotations/jobs?bookId= lista los jobs de un libro', async () => {
+    const res = await fetch(`${baseUrl}/api/annotations/jobs?bookId=b1`)
+    assert.equal(res.status, 200)
+    const body = await res.json()
+    assert.equal(body.bookId, 'b1')
+    assert.ok(Array.isArray(body.jobs))
+    assert.ok(body.jobs.length >= 3)
+  })
+
+  test('GET /api/annotations/jobs sin bookId devuelve 400', async () => {
+    const res = await fetch(`${baseUrl}/api/annotations/jobs`)
+    assert.equal(res.status, 400)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Pipeline quality (qwen solo)
+  // ---------------------------------------------------------------------------
+
+  test('POST /api/annotations con type=quality usa un solo paso (qwen3-omni)', async () => {
+    const qMock = makeMockLiteLLM()
+    const qCtx = createApp({
+      callLiteLLM: qMock.fn,
+      ocrModel: 'qwen3-omni',
+      llmModel: 'deepseek-v4-flash',
+    })
+    const qServer = qCtx.app.listen(0)
+    await new Promise((resolve) => qServer.once('listening', resolve))
+    const url = `http://127.0.0.1:${qServer.address().port}`
+    try {
+      const res = await fetch(`${url}/api/annotations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bookId: 'q1', pageNumber: 1, image: PNG_1x1, mimeType: 'image/png', type: 'quality' }),
+      })
+      assert.equal(res.status, 200)
+      const body = await res.json()
+      assert.ok(Array.isArray(body.blocks))
+      assert.equal(body.blocks.length, 1)
+      // Solo debe llamar a qwen3-omni UNA vez (no a deepseek)
+      assert.equal(qMock.calls.length, 1)
+      assert.equal(qMock.calls[0].model, 'qwen3-omni')
+    } finally {
+      await new Promise((resolve) => qServer.close(resolve))
+      qCtx.db.close()
     }
   })
 })
