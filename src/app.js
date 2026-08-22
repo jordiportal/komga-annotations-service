@@ -51,7 +51,15 @@ export function createApp(opts = {}) {
     llmModel = process.env.LLM_MODEL || 'deepseek-v4-flash',
     prefetchCount = Number(process.env.PREFETCH_COUNT || 3),
     allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
+    targetLang = process.env.TARGET_LANG || 'es',
   } = opts
+
+  // Idioma de destino de las traducciones. 'es' = castellano, 'ca' = català.
+  const TARGET_LANG_NAME = targetLang === 'ca' ? 'català' : 'castellano'
+  const TARGET_LANG_EXTRA = targetLang === 'ca'
+    ? 'Traduce SIEMPRE al català (lengua catalana), nunca a otro idioma.'
+    : 'Traduce SIEMPRE al castellano (español), nunca a otro idioma.'
+  const TARGET_LANG_BAN = 'Está TERMINANTEMENTE PROHIBIDO traducir al chino, japonés, inglés o cualquier otro idioma distinto del idioma objetivo. Si el texto ya está en el idioma objetivo, tradúcelo igualmente de forma natural.'
 
   const app = express()
 
@@ -261,7 +269,7 @@ Reglas:
 
   /**
    * Paso 2 — Estructuración: deepseek-v4-flash recibe el texto OCR y añade
-   * furigana + kanjis + traducción al español. Devuelve el JSON estructurado.
+   * furigana + kanjis + traducción al idioma objetivo. Devuelve el JSON estructurado.
    */
   async function runDeepSeek(ocrText) {
     const system = `Eres un asistente experto en japonés. Recibes el texto OCR de una página de manga (un bloque por línea).
@@ -273,9 +281,9 @@ Debes responder SOLO con JSON válido, sin markdown ni comentarios, con esta est
       "bbox": [0, 0, 0, 0],
       "original": "texto japonés original (un párrafo o globo de diálogo)",
       "furigana": "texto con lectura en furigana: 漢字(かんじ) para cada kanji",
-      "translation": "traducción breve al español",
+      "translation": "traducción breve al ${TARGET_LANG_NAME}",
       "kanji": [
-        { "kanji": "漢字", "reading": "かんじ", "meaning": "significado en español" }
+        { "kanji": "漢字", "reading": "かんじ", "meaning": "significado en ${TARGET_LANG_NAME}" }
       ]
     }
   ]
@@ -285,8 +293,8 @@ Reglas:
 - Divide el texto en bloques lógicos (cada línea/globo de diálogo es un bloque).
 - "bbox" déjalo en [0,0,0,0] (no se usa para posicionar, el panel es lateral).
 - "furigana": para cada kanji añade su lectura en hiragana entre paréntesis justo después.
-- "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado.
-- "translation": traducción natural y breve al español.
+- "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado (en ${TARGET_LANG_NAME}).
+- "translation": traducción natural y breve al ${TARGET_LANG_NAME}. ${TARGET_LANG_EXTRA} ${TARGET_LANG_BAN}
 - Si un bloque no tiene kanjis, "kanji" será un array vacío.
 - No inventes texto: usa exactamente el que recibes. Si el OCR tiene errores evidentes, corrígelos con criterio.`
 
@@ -309,17 +317,17 @@ Debes responder SOLO con JSON válido, sin markdown ni comentarios, con esta est
 {
   "original": "texto japonés original exacto",
   "furigana": "texto con lectura en furigana: 漢字(かんじ) para cada kanji",
-  "translation": "traducción natural y completa al español",
+  "translation": "traducción natural y completa al ${TARGET_LANG_NAME}",
   "kanji": [
-    { "kanji": "漢字", "reading": "かんじ", "meaning": "significado en español" }
+    { "kanji": "漢字", "reading": "かんじ", "meaning": "significado en ${TARGET_LANG_NAME}" }
   ]
 }
 
 Reglas:
 - "original": copia EXACTA del texto recibido, sin modificar nada.
 - "furigana": para cada kanji añade su lectura en hiragana entre paréntesis justo después. Mantén el resto del texto igual.
-- "translation": traducción completa, natural y fiel al español (no un resumen).
-- "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado. Si no hay kanjis, array vacío.
+- "translation": traducción completa, natural y fiel al ${TARGET_LANG_NAME} (no un resumen). ${TARGET_LANG_EXTRA} ${TARGET_LANG_BAN}
+- "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado (en ${TARGET_LANG_NAME}). Si no hay kanjis, array vacío.
 - No inventes texto: usa exactamente el que recibes. Si hay errores evidentes, corrígelos con criterio.`
 
     const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto:\n' + text }], { maxTokens: 4096, temperature: 0.1 })
@@ -339,7 +347,7 @@ Reglas:
     const resized = await resizeImage(imageBase64, mimeType)
     const system = `Eres un asistente experto en japonés y OCR de manga. Recibes la imagen de una página de manga.
 
-Debes transcribir TODO el texto en orden de lectura (derecha a izquierda, arriba a abajo) y, para cada bloque, añadir furigana, traducción al español y los kanjis difíciles.
+Debes transcribir TODO el texto en orden de lectura (derecha a izquierda, arriba a abajo) y, para cada bloque, añadir furigana, traducción al ${TARGET_LANG_NAME} y los kanjis difíciles.
 
 Responde SOLO con JSON válido, sin markdown ni comentarios, con esta estructura:
 {
@@ -348,7 +356,7 @@ Responde SOLO con JSON válido, sin markdown ni comentarios, con esta estructura
       "bbox": [0, 0, 0, 0],
       "original": "texto japonés original (un párrafo o globo de diálogo)",
       "furigana": "texto con lectura en furigana: 漢字(かんじ) para cada kanji",
-      "translation": "traducción breve al español",
+      "translation": "traducción breve al ${TARGET_LANG_NAME}",
       "kanji": [
         { "kanji": "漢字", "reading": "かんじ", "meaning": "significado en español" }
       ]
@@ -360,8 +368,8 @@ Reglas:
 - Divide el texto en bloques lógicos (cada globo de diálogo o párrafo coherente es un bloque).
 - "bbox" déjalo en [0,0,0,0] (no se usa para posicionar, el panel es lateral).
 - "furigana": para cada kanji añade su lectura en hiragana entre paréntesis justo después.
-- "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado.
-- "translation": traducción natural y breve al español.
+- "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado (en ${TARGET_LANG_NAME}).
+- "translation": traducción natural y breve al ${TARGET_LANG_NAME}. ${TARGET_LANG_EXTRA} ${TARGET_LANG_BAN}
 - Si un bloque no tiene kanjis, "kanji" será un array vacío.
 - No inventes texto: usa exactamente el que recibes. Si el OCR tiene errores evidentes, corrígelos con criterio.`
 
