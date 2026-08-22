@@ -124,6 +124,31 @@ export function createApp(opts = {}) {
   )
   const stmtJobList = db.prepare('SELECT * FROM translation_jobs WHERE book_id = ? ORDER BY created_at DESC')
 
+  // --- Anotaciones de texto (EPUB): furigana + traducción por párrafo ---
+  // Clave: (book_id, chapter, paragraph) — el párrafo es la unidad, no hay OCR.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS text_annotations (
+      book_id    TEXT NOT NULL,
+      chapter    TEXT NOT NULL,
+      paragraph  INTEGER NOT NULL,
+      payload    TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (book_id, chapter, paragraph)
+    );
+  `)
+  const stmtTextGet = db.prepare('SELECT payload FROM text_annotations WHERE book_id = ? AND chapter = ? AND paragraph = ?')
+  const stmtTextPut = db.prepare(
+    'INSERT OR REPLACE INTO text_annotations (book_id, chapter, paragraph, payload, created_at) VALUES (?, ?, ?, ?, ?)',
+  )
+
+  function getTextStored(bookId, chapter, paragraph) {
+    const row = stmtTextGet.get(String(bookId), String(chapter), Number(paragraph))
+    return row ? JSON.parse(row.payload) : null
+  }
+  function storeTextResult(bookId, chapter, paragraph, result) {
+    stmtTextPut.run(String(bookId), String(chapter), Number(paragraph), JSON.stringify(result), Date.now())
+  }
+
   function getStored(bookId, pageNumber) {
     const row = stmtGet.get(String(bookId), Number(pageNumber))
     return row ? JSON.parse(row.payload) : null
@@ -270,6 +295,40 @@ Reglas:
     const jsonMatch = raw.match(/\{[\s\S]*\}/)
     if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
     return JSON.parse(jsonMatch[0])
+  }
+
+  /**
+   * Procesa un párrafo de texto (EPUB) directamente con DeepSeek, SIN OCR.
+   * El texto ya viene como string (el EPUB tiene el texto real incrustado).
+   * Devuelve { original, furigana, translation, kanji }.
+   */
+  async function runDeepSeekText(text) {
+    const system = `Eres un asistente experto en japonés. Recibes un párrafo de texto en japonés (de un libro/novela ligera).
+
+Debes responder SOLO con JSON válido, sin markdown ni comentarios, con esta estructura:
+{
+  "original": "texto japonés original exacto",
+  "furigana": "texto con lectura en furigana: 漢字(かんじ) para cada kanji",
+  "translation": "traducción natural y completa al español",
+  "kanji": [
+    { "kanji": "漢字", "reading": "かんじ", "meaning": "significado en español" }
+  ]
+}
+
+Reglas:
+- "original": copia EXACTA del texto recibido, sin modificar nada.
+- "furigana": para cada kanji añade su lectura en hiragana entre paréntesis justo después. Mantén el resto del texto igual.
+- "translation": traducción completa, natural y fiel al español (no un resumen).
+- "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado. Si no hay kanjis, array vacío.
+- No inventes texto: usa exactamente el que recibes. Si hay errores evidentes, corrígelos con criterio.`
+
+    const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto:\n' + text }], { maxTokens: 4096, temperature: 0.1 })
+
+    const jsonMatch = raw.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
+    const result = JSON.parse(jsonMatch[0])
+    if (!result.original) result.original = text
+    return result
   }
 
   /**
@@ -490,6 +549,44 @@ Reglas:
     const rows = stmtPages.all(String(bookId))
     res.json({ bookId: String(bookId), pages: rows.map((r) => r.page_number) })
   })
+
+  // ---------------------------------------------------------------------------
+  // Anotaciones de texto (EPUB) — furigana + traducción por párrafo, sin OCR
+  // ---------------------------------------------------------------------------
+
+  // GET /api/annotations/text/:bookId/:chapter/:paragraph — consulta el store
+  app.get('/api/annotations/text/:bookId/:chapter/:paragraph', (req, res) => {
+    const { bookId, chapter, paragraph } = req.params
+    const stored = getTextStored(bookId, chapter, paragraph)
+    if (!stored) return res.status(404).json({ error: 'Not cached' })
+    res.json(stored)
+  })
+
+  // POST /api/annotations/text — procesa un párrafo con DeepSeek (o devuelve del store)
+  app.post('/api/annotations/text', async (req, res) => {
+    const { bookId, chapter, paragraph, text } = req.body
+    if (!text || !text.trim()) return res.status(400).json({ error: 'Missing "text" in body' })
+    if (bookId == null || chapter == null || paragraph == null) {
+      return res.status(400).json({ error: 'Missing "bookId"/"chapter"/"paragraph" in body' })
+    }
+    // 1) Store persistente
+    const stored = getTextStored(bookId, chapter, paragraph)
+    if (stored) {
+      console.log(`[annotations] TEXT STORE HIT book=${bookId} ch=${chapter} p=${paragraph}`)
+      return res.json(stored)
+    }
+    // 2) Análisis con DeepSeek
+    try {
+      const result = await runDeepSeekText(text)
+      storeTextResult(bookId, chapter, paragraph, result)
+      console.log(`[annotations] TEXT done book=${bookId} ch=${chapter} p=${paragraph}`)
+      res.json(result)
+    } catch (err) {
+      console.error('[annotations] TEXT error:', err.message)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
 
   // GET /api/annotations/:bookId/:pageNumber — consulta el store sin imagen
   app.get('/api/annotations/:bookId/:pageNumber', (req, res) => {
