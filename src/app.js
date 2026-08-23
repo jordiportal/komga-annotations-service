@@ -327,15 +327,55 @@ Reglas:
 - "original": copia EXACTA del texto recibido, sin modificar nada.
 - "furigana": para cada kanji añade su lectura en hiragana entre paréntesis justo después. Mantén el resto del texto igual.
 - "translation": traducción completa, natural y fiel al ${TARGET_LANG_NAME} (no un resumen). ${TARGET_LANG_EXTRA} ${TARGET_LANG_BAN}
+- CRÍTICO: la traducción DEBE estar escrita en ${TARGET_LANG_NAME}. NUNCA la escribas en chino (hanzi), japonés (kanji/kana) ni inglés. Si el texto original ya es japonés, tradúcelo al ${TARGET_LANG_NAME}; no lo dejes en japonés.
 - "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado (en ${TARGET_LANG_NAME}). Si no hay kanjis, array vacío.
 - No inventes texto: usa exactamente el que recibes. Si hay errores evidentes, corrígelos con criterio.`
 
-    const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto:\n' + text }], { maxTokens: 4096, temperature: 0.1 })
+    // Reintentos: hasta 2 intentos extra si el JSON es inválido o la traducción sale en chino/japonés.
+    let lastErr = null
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto:\n' + text }], { maxTokens: 8192, temperature: 0.1 })
+        const jsonMatch = raw.match(/\{[\s\S]*\}/)
+        if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
+        const result = JSON.parse(jsonMatch[0])
+        if (!result.original) result.original = text
+        // Validar que la traducción NO esté en chino/japonés
+        validateTranslationLang(result)
+        return result
+      } catch (e) {
+        lastErr = e
+        if (attempt < 2) {
+          console.warn(`[annotations] TEXT reintento ${attempt + 1} tras: ${e.message.slice(0, 120)}`)
+        }
+      }
+    }
+    throw lastErr
+  }
 
-    const jsonMatch = raw.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
-    const result = JSON.parse(jsonMatch[0])
-    if (!result.original) result.original = text
+
+  /**
+   * Detecta si un texto contiene caracteres CJK (chino/japonés).
+   * Devuelve true si hay caracteres Han (kanji/hanzi) o kana.
+   */
+  function containsCJK(text) {
+    if (!text) return false
+    // Rango Han (kanji/hanzi) y kana (hiragana/katakana)
+    return /[\u4E00-\u9FFF\u3040-\u30FF\u3400-\u4DBF]/.test(text)
+  }
+
+  /**
+   * Valida que la traducción esté en el idioma objetivo (no chino/japonés).
+   * Si la traducción contiene caracteres CJK, lanza un error para reintentar.
+   */
+  function validateTranslationLang(result) {
+    const translation = (result && result.translation) || ''
+    const meaning = (result && result.kanji && Array.isArray(result.kanji))
+      ? result.kanji.map(k => (k && k.meaning) || '').join(' ')
+      : ''
+    if (containsCJK(translation) || containsCJK(meaning)) {
+      throw new Error(`traducción en idioma no objetivo (contiene CJK): ${translation.slice(0, 80)}`)
+    }
     return result
   }
 
