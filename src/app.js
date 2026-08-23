@@ -328,6 +328,7 @@ Reglas:
 - "furigana": para cada kanji añade su lectura en hiragana entre paréntesis justo después. Mantén el resto del texto igual.
 - "translation": traducción completa, natural y fiel al ${TARGET_LANG_NAME} (no un resumen). ${TARGET_LANG_EXTRA} ${TARGET_LANG_BAN}
 - CRÍTICO: la traducción DEBE estar escrita en ${TARGET_LANG_NAME}. NUNCA la escribas en chino (hanzi), japonés (kanji/kana) ni inglés. Si el texto original ya es japonés, tradúcelo al ${TARGET_LANG_NAME}; no lo dejes en japonés.
+- IMPORTANTE: las comillas 「」 y 『』 del texto son comillas JAPONESAS (se usan en japonés para marcar diálogos), NO indican que el texto sea chino. El texto es japonés y debe traducirse al ${TARGET_LANG_NAME}. No traduzcas al chino por ver estas comillas.
 - "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado (en ${TARGET_LANG_NAME}). Si no hay kanjis, array vacío.
 - No inventes texto: usa exactamente el que recibes. Si hay errores evidentes, corrígelos con criterio.`
 
