@@ -311,6 +311,9 @@ Reglas:
    * Devuelve { original, furigana, translation, kanji }.
    */
   async function runDeepSeekText(text) {
+    // Las comillas japonesas 「」/『』 hacen que deepseek-v4-flash traduzca al chino.
+    // Las reemplazamos por comillas normales antes de enviar (y restauramos el original al final).
+    const cleanText = text.replace(/[「」『』]/g, '"')
     const system = `Eres un asistente experto en japonés. Recibes un párrafo de texto en japonés (de un libro/novela ligera).
 
 Debes responder SOLO con JSON válido, sin markdown ni comentarios, con esta estructura:
@@ -336,11 +339,12 @@ Reglas:
     let lastErr = null
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto:\n' + text }], { maxTokens: 8192, temperature: 0.1 })
+        const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto:\n' + cleanText }], { maxTokens: 8192, temperature: 0.1 })
         const jsonMatch = raw.match(/\{[\s\S]*\}/)
         if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
         const result = JSON.parse(jsonMatch[0])
-        if (!result.original) result.original = text
+        // Restaurar las comillas japonesas originales en el campo "original"
+        result.original = text
         // Validar que la traducción NO esté en chino/japonés
         validateTranslationLang(result)
         return result
