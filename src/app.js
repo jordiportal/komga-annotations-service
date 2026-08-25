@@ -365,8 +365,14 @@ Reglas:
    */
   function containsCJK(text) {
     if (!text) return false
-    // Rango Han (kanji/hanzi) y kana (hiragana/katakana)
-    return /[\u4E00-\u9FFF\u3040-\u30FF\u3400-\u4DBF]/.test(text)
+    // Kana (hiragana/katakana) = japonés inequívoco
+    if (/[\u3040-\u30FF]/.test(text)) return true
+    // Han (kanji/hanzi): solo se considera CJK si es una proporción alta del texto.
+    // Un kanji suelto en un párrafo castellano (nombre propio, carácter residual)
+    // NO es chino/japonés y no debe rechazarse.
+    const han = (text.match(/[\u4E00-\u9FFF\u3400-\u4DBF]/g) || []).length
+    const total = text.replace(/\s/g, '').length
+    return total > 0 && (han / total) > 0.30
   }
 
   /**
