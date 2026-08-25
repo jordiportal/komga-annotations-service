@@ -336,10 +336,18 @@ Reglas:
 - No inventes texto: usa exactamente el que recibes. Si hay errores evidentes, corrígelos con criterio.`
 
     // Reintentos: hasta 2 intentos extra si el JSON es inválido o la traducción sale en chino/japonés.
+    // En cada reintento añadimos una instrucción extra con el motivo del fallo para que el modelo
+    // NO repita el mismo error (el reintento con el mismo prompt falla igual).
     let lastErr = null
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto:\n' + cleanText }], { maxTokens: 8192, temperature: 0.1 })
+        let instruction = ''
+        if (attempt > 0) {
+          instruction = `\n\nIMPORTANTE: El intento anterior FALLÓ por este motivo: "${String(lastErr && lastErr.message || '').slice(0, 200)}".\n` +
+            `Corrige el error. Si el motivo es que la traducción salió en chino/japonés, vuelve a traducirla AHORA al ${TARGET_LANG_NAME} correctamente. ` +
+            `Si el motivo es que el JSON estaba truncado/incompleto, responde el JSON COMPLETO y CERRADO con su llave final.`
+        }
+        const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto:\n' + cleanText + instruction }], { maxTokens: 8192, temperature: 0.1 })
         const jsonMatch = raw.match(/\{[\s\S]*\}/)
         if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
         const result = JSON.parse(jsonMatch[0])
