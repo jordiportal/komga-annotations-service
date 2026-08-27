@@ -311,29 +311,30 @@ Reglas:
    * Devuelve { original, furigana, translation, kanji }.
    */
   async function runDeepSeekText(text) {
-    // Las comillas japonesas 「」/『』 hacen que deepseek-v4-flash traduzca al chino.
-    // Las reemplazamos por comillas normales antes de enviar (y restauramos el original al final).
+    // Las comillas japonesas 「」/『』 se reemplazan por comillas normales antes de enviar
+    // (y se restaura el original al final). El prompt es CORTO y directo: un prompt largo
+    // con muchas menciones a "chino/hanzi/kanji" confunde al modelo y dispara la
+    // traducción al chino (verificado con prueba A/B: el mismo modelo traduce bien
+    // al español con un prompt limpio).
     const cleanText = text.replace(/[「」『』]/g, '"')
-    const system = `Eres un asistente experto en japonés. Recibes un párrafo de texto en japonés (de un libro/novela ligera).
+    const system = `Eres un traductor profesional de japonés a ${TARGET_LANG_NAME}. Recibes un párrafo de una novela ligera japonesa.
 
-Debes responder SOLO con JSON válido, sin markdown ni comentarios, con esta estructura:
+Responde SOLO con JSON válido, sin markdown ni comentarios, con esta estructura exacta:
 {
-  "original": "texto japonés original exacto",
-  "furigana": "texto con lectura en furigana: 漢字(かんじ) para cada kanji",
-  "translation": "traducción natural y completa al ${TARGET_LANG_NAME}",
+  "original": "el texto japonés exacto que recibes",
+  "furigana": "el mismo texto pero con la lectura en hiragana de cada kanji entre paréntesis, ej: 魔物(まもの)",
+  "translation": "traducción completa, natural y fiel al ${TARGET_LANG_NAME}",
   "kanji": [
-    { "kanji": "漢字", "reading": "かんじ", "meaning": "significado en ${TARGET_LANG_NAME}" }
+    { "kanji": "un kanji del texto", "reading": "su lectura en hiragana", "meaning": "su significado en ${TARGET_LANG_NAME}" }
   ]
 }
 
 Reglas:
-- "original": copia EXACTA del texto recibido, sin modificar nada.
-- "furigana": para cada kanji añade su lectura en hiragana entre paréntesis justo después. Mantén el resto del texto igual.
-- "translation": traducción completa, natural y fiel al ${TARGET_LANG_NAME} (no un resumen). ${TARGET_LANG_EXTRA} ${TARGET_LANG_BAN}
-- CRÍTICO: la traducción DEBE estar escrita en ${TARGET_LANG_NAME}. NUNCA la escribas en chino (hanzi), japonés (kanji/kana) ni inglés. Si el texto original ya es japonés, tradúcelo al ${TARGET_LANG_NAME}; no lo dejes en japonés.
-- IMPORTANTE: las comillas 「」 y 『』 del texto son comillas JAPONESAS (se usan en japonés para marcar diálogos), NO indican que el texto sea chino. El texto es japonés y debe traducirse al ${TARGET_LANG_NAME}. No traduzcas al chino por ver estas comillas.
-- "kanji": lista SOLO los kanjis (no hiragana/katakana) que puedan resultar difíciles, con su lectura y significado (en ${TARGET_LANG_NAME}). Si no hay kanjis, array vacío.
-- No inventes texto: usa exactamente el que recibes. Si hay errores evidentes, corrígelos con criterio.`
+- "original": copia exacta del texto recibido.
+- "furigana": añade la lectura en hiragana entre paréntesis tras cada kanji, manteniendo el resto igual.
+- "translation": traduce TODO el texto al ${TARGET_LANG_NAME} de forma natural y completa (no un resumen).
+- "kanji": lista los kanjis difíciles con su lectura y significado en ${TARGET_LANG_NAME}. Si no hay, array vacío.
+- No inventes texto: usa exactamente el que recibes.`
 
     // Reintentos: hasta 2 intentos extra si el JSON es inválido o la traducción sale en chino/japonés.
     // En cada reintento añadimos una instrucción extra con el motivo del fallo para que el modelo
