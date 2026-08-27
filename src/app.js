@@ -49,6 +49,7 @@ export function createApp(opts = {}) {
     liteLLMApiKey = process.env.LITELLM_API_KEY || 'sk-litellm-8d13346fba6cd9a78eee874cb8ef4e88bf6c4921',
     ocrModel = process.env.OCR_MODEL || 'qwen3-omni',
     llmModel = process.env.LLM_MODEL || 'deepseek-v4-flash',
+    fallbackModel = process.env.FALLBACK_MODEL || 'kimi-k3',
     prefetchCount = Number(process.env.PREFETCH_COUNT || 3),
     allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
     targetLang = process.env.TARGET_LANG || 'es',
@@ -336,21 +337,24 @@ Reglas:
 - "kanji": lista los kanjis difíciles con su lectura y significado en ${TARGET_LANG_NAME}. Si no hay, array vacío.
 - No inventes texto: usa exactamente el que recibes.`
 
-    // Reintentos: hasta 2 intentos extra si el JSON es inválido o la traducción sale en chino/japonés.
-    // En cada reintento añadimos una instrucción extra con el motivo del fallo para que el modelo
-    // NO repita el mismo error (el reintento con el mismo prompt falla igual).
+    // Reintentos: el primer intento usa el modelo principal (llmModel).
+    // Si falla (JSON inválido o traducción en chino/japonés), los reintentos
+    // pasan al modelo de respaldo (fallbackModel, p.ej. kimi-k3), que no tiene
+    // el sesgo hacia el chino de deepseek. Repetir el mismo modelo no sirve
+    // (falla igual), así que no lo repetimos.
     let lastErr = null
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
+        const model = attempt === 0 ? llmModel : fallbackModel
         let instruction = ''
         if (attempt > 0) {
           instruction = `\n\nIMPORTANTE: El intento anterior FALLÓ por este motivo: "${String(lastErr && lastErr.message || '').slice(0, 200)}".\n` +
             `Corrige el error. Si el motivo es que la traducción salió en chino/japonés, vuelve a traducirla AHORA al ${TARGET_LANG_NAME} correctamente. ` +
             `Si el motivo es que el JSON estaba truncado/incompleto, responde el JSON COMPLETO y CERRADO con su llave final.`
         }
-        const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto:\n' + cleanText + instruction }], { maxTokens: 8192, temperature: 0.1 })
+        const raw = await callLiteLLM(model, [{ role: 'user', content: system + '\n\nTexto:\n' + cleanText + instruction }], { maxTokens: 8192, temperature: 0.1 })
         const jsonMatch = raw.match(/\{[\s\S]*\}/)
-        if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
+        if (!jsonMatch) throw new Error(`${model} no devolvió JSON válido: ${raw.slice(0, 300)}`)
         const result = JSON.parse(jsonMatch[0])
         // Restaurar las comillas japonesas originales en el campo "original"
         result.original = text
@@ -360,7 +364,7 @@ Reglas:
       } catch (e) {
         lastErr = e
         if (attempt < 2) {
-          console.warn(`[annotations] TEXT reintento ${attempt + 1} tras: ${e.message.slice(0, 120)}`)
+          console.warn(`[annotations] TEXT reintento ${attempt + 1} (${attempt === 0 ? llmModel : fallbackModel}) tras: ${e.message.slice(0, 120)}`)
         }
       }
     }
