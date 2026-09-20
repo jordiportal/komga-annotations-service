@@ -148,6 +148,7 @@ export function createApp(opts = {}) {
   const stmtTextPut = db.prepare(
     'INSERT OR REPLACE INTO text_annotations (book_id, chapter, paragraph, payload, created_at) VALUES (?, ?, ?, ?, ?)',
   )
+  const stmtTextCount = db.prepare('SELECT COUNT(*) AS n FROM text_annotations WHERE book_id = ?')
 
   function getTextStored(bookId, chapter, paragraph) {
     const row = stmtTextGet.get(String(bookId), String(chapter), Number(paragraph))
@@ -719,6 +720,13 @@ Reglas:
     const stored = getTextStored(bookId, chapter, paragraph)
     if (!stored) return res.status(404).json({ error: 'Not cached' })
     res.json(stored)
+  })
+
+  // GET /api/annotations/text/:bookId/status — número de párrafos traducidos de un libro EPUB
+  app.get('/api/annotations/text/:bookId/status', (req, res) => {
+    const { bookId } = req.params
+    const n = stmtTextCount.get(String(bookId)).n
+    res.json({ bookId: String(bookId), translatedParagraphs: n })
   })
 
   // POST /api/annotations/text — procesa un párrafo con DeepSeek (o devuelve del store)
