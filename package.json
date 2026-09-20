@@ -1,7 +1,7 @@
 {
   "name": "komga-annotations-service",
   "version": "0.1.0",
-  "description": "Servicio de anotaciones para Komga: OCR (qwen3-omni) + estructuración (deepseek-v4-flash) vía LiteLLM. Protege la API key del cliente.",
+  "description": "Servicio de anotaciones para Komga: traducción/kanjis de manga en UN SOLO paso con deepseek-v4-flash (visión) vía LiteLLM. Protege la API key del cliente.",
   "type": "module",
   "main": "src/server.js",
   "scripts": {

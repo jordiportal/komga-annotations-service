@@ -15,7 +15,7 @@ const PNG_1x1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8
 // PNG 1x1 distinto (rojo) — para forzar análisis real en el prefetch (evita cache hit por hash de imagen)
 const PNG_1x1_RED = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 
-// Resultado JSON que devolverá el "deepseek-v4-flash" mockeado (paso 2: estructuración)
+// Resultado JSON que devolverá el "deepseek-v4-flash" mockeado (paso único: OCR + estructuración)
 const MOCK_RESULT = {
   blocks: [
     {
@@ -34,20 +34,20 @@ function makeMockLiteLLM() {
     calls,
     fn: async (model, messages, opts) => {
       calls.push({ model, messages, opts })
+      if (model === 'deepseek-v4-flash') {
+        // Pipeline 'fast' (1 paso): recibe la imagen y devuelve el JSON estructurado
+        return JSON.stringify(MOCK_RESULT)
+      }
       if (model === 'qwen3-omni') {
         // Si la petición incluye una imagen (content con image_url) → modo quality (JSON)
-        // Si es solo texto → paso 1 OCR (texto plano)
+        // Si es solo texto → paso 1 OCR (texto plano) del pipeline 'legacy'
         const content = messages?.[0]?.content
         const hasImage = Array.isArray(content) && content.some((c) => c.type === 'image_url')
         if (hasImage) {
           return JSON.stringify(MOCK_RESULT)
         }
-        // Paso 1 (OCR): devuelve texto plano
+        // Paso 1 (OCR) del pipeline 'legacy': devuelve texto plano
         return 'こんにちは世界\n'
-      }
-      if (model === 'deepseek-v4-flash') {
-        // Paso 2 (estructuración): devuelve JSON
-        return JSON.stringify(MOCK_RESULT)
       }
       throw new Error(`Unexpected model ${model}`)
     },
@@ -97,10 +97,12 @@ describe('Komga Annotations Service', () => {
     assert.ok(Array.isArray(body.blocks))
     assert.equal(body.blocks.length, 1)
     assert.equal(body.blocks[0].furigana, 'こんにちは世界(せかい)')
-    // Debe haber llamado a qwen3-omni (OCR) y deepseek-v4-flash (estructuración)
-    assert.equal(mock.calls.length, 2)
-    assert.equal(mock.calls[0].model, 'qwen3-omni')
-    assert.equal(mock.calls[1].model, 'deepseek-v4-flash')
+    // 'fast' (por defecto) hace UN SOLO paso: solo deepseek-v4-flash con la imagen
+    assert.equal(mock.calls.length, 1)
+    assert.equal(mock.calls[0].model, 'deepseek-v4-flash')
+    // La petición debe incluir la imagen (visión)
+    const content = mock.calls[0].messages?.[0]?.content
+    assert.ok(Array.isArray(content) && content.some((c) => c.type === 'image_url'), 'debe enviar la imagen')
   })
 
   test('POST /api/annotations con la misma página devuelve del STORE (sin llamar al LLM)', async () => {
@@ -150,11 +152,11 @@ describe('Komga Annotations Service', () => {
     const body = await res.json()
     assert.equal(body.status, 'queued')
 
-    // Esperar a que el background termine (2 llamadas: qwen3-omni + deepseek)
-    for (let i = 0; i < 50 && mock.calls.length < callsBefore + 2; i++) {
+    // Esperar a que el background termine (1 llamada: deepseek-v4-flash con imagen)
+    for (let i = 0; i < 50 && mock.calls.length < callsBefore + 1; i++) {
       await new Promise((r) => setTimeout(r, 50))
     }
-    assert.ok(mock.calls.length >= callsBefore + 2, 'el prefetch debería haber llamado al LLM')
+    assert.ok(mock.calls.length >= callsBefore + 1, 'el prefetch debería haber llamado al LLM')
 
     // Ahora la página está en el store
     const storedRes = await fetch(`${baseUrl}/api/annotations/b2/5`)
@@ -181,7 +183,7 @@ describe('Komga Annotations Service', () => {
 
   test('el LLM que devuelve JSON inválido produce 500', async () => {
     const badCtx = createApp({
-      callLiteLLM: async (model) => (model === 'qwen3-omni' ? 'texto ocr\n' : 'esto no es json'),
+      callLiteLLM: async (model) => (model === 'deepseek-v4-flash' ? 'esto no es json' : 'texto ocr\n'),
       ocrModel: 'qwen3-omni',
       llmModel: 'deepseek-v4-flash',
     })
@@ -324,6 +326,36 @@ describe('Komga Annotations Service', () => {
     } finally {
       await new Promise((resolve) => qServer.close(resolve))
       qCtx.db.close()
+    }
+  })
+
+  test('POST /api/annotations con type=legacy usa 2 pasos (OCR qwen3-omni + deepseek)', async () => {
+    const lMock = makeMockLiteLLM()
+    const lCtx = createApp({
+      callLiteLLM: lMock.fn,
+      ocrModel: 'qwen3-omni',
+      llmModel: 'deepseek-v4-flash',
+    })
+    const lServer = lCtx.app.listen(0)
+    await new Promise((resolve) => lServer.once('listening', resolve))
+    const url = `http://127.0.0.1:${lServer.address().port}`
+    try {
+      const res = await fetch(`${url}/api/annotations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bookId: 'l1', pageNumber: 1, image: PNG_1x1, mimeType: 'image/png', type: 'legacy' }),
+      })
+      assert.equal(res.status, 200)
+      const body = await res.json()
+      assert.ok(Array.isArray(body.blocks))
+      assert.equal(body.blocks.length, 1)
+      // Debe llamar a qwen3-omni (OCR) y deepseek-v4-flash (estructuración)
+      assert.equal(lMock.calls.length, 2)
+      assert.equal(lMock.calls[0].model, 'qwen3-omni')
+      assert.equal(lMock.calls[1].model, 'deepseek-v4-flash')
+    } finally {
+      await new Promise((resolve) => lServer.close(resolve))
+      lCtx.db.close()
     }
   })
 })

@@ -1,9 +1,8 @@
 /**
  * Komga Annotations Service — aplicación Express (testeable)
  *
- * Pipeline (2 pasos):
- *   1. OCR con qwen3-omni: extrae el texto plano de la página (rápido).
- *   2. Estructuración con deepseek-v4-flash: furigana + kanjis + traducción.
+ * Pipeline (1 paso):
+ *   deepseek-v4-flash (con visión): OCR + furigana + kanjis + traducción en una sola llamada.
  *
  * Este módulo expone `createApp()` con dependencias inyectables para poder testear
  * el servicio sin arrancar un servidor real ni llamar a la API de LiteLLM.
@@ -11,7 +10,7 @@
  * `server.js` es el punto de arranque: importa createApp() y hace app.listen().
  *
  * Endpoints:
- *   POST /api/annotations            body: { bookId, pageNumber, image, mimeType }
+ *   POST /api/annotations            body: { bookId, pageNumber, image, mimeType, type }
  *   GET  /api/annotations/:bookId/:pageNumber
  *   GET  /api/annotations/:bookId/status
  *   POST /api/annotations/prefetch
@@ -45,7 +44,7 @@ export function createApp(opts = {}) {
   const {
     callLiteLLM: injectedCallLiteLLM,
     dbPath,
-    liteLLMUrl = process.env.LITELLM_URL || 'https://ollama.khlloreda.com',
+    liteLLMUrl = process.env.LITELLM_URL || 'https://litellm.khlloreda.com',
     liteLLMApiKey = process.env.LITELLM_API_KEY || 'sk-litellm-8d13346fba6cd9a78eee874cb8ef4e88bf6c4921',
     ocrModel = process.env.OCR_MODEL || 'qwen3-omni',
     llmModel = process.env.LLM_MODEL || 'deepseek-v4-flash',
@@ -176,19 +175,25 @@ export function createApp(opts = {}) {
   // ---------------------------------------------------------------------------
   // LiteLLM
   // ---------------------------------------------------------------------------
-  async function defaultCallLiteLLM(model, messages, { maxTokens = 4096, temperature = 0.1 } = {}) {
+  async function defaultCallLiteLLM(model, messages, { maxTokens = 4096, temperature = 0.1, reasoningEffort } = {}) {
+    const body = {
+      model,
+      messages,
+      max_tokens: maxTokens,
+      temperature,
+    }
+    // Desactivar el razonamiento del modelo (deepseek-v4-flash es un modelo de
+    // razonamiento: consume muchos tokens en reasoning_content antes de generar el
+    // content final, lo que hace que el proxy openresty corte con 504). Con
+    // reasoning_effort='none' la respuesta es ~6x más rápida y el content llega completo.
+    if (reasoningEffort) body.reasoning_effort = reasoningEffort
     const res = await fetch(`${liteLLMUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${liteLLMApiKey}`,
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        max_tokens: maxTokens,
-        temperature,
-      }),
+      body: JSON.stringify(body),
     })
 
     if (!res.ok) {
@@ -299,7 +304,7 @@ Reglas:
 - Si un bloque no tiene kanjis, "kanji" será un array vacío.
 - No inventes texto: usa exactamente el que recibes. Si el OCR tiene errores evidentes, corrígelos con criterio.`
 
-    const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto OCR:\n' + ocrText }], { maxTokens: 4096, temperature: 0.1 })
+    const raw = await callLiteLLM(llmModel, [{ role: 'user', content: system + '\n\nTexto OCR:\n' + ocrText }], { maxTokens: 4096, temperature: 0.1, reasoningEffort: 'none' })
 
     const jsonMatch = raw.match(/\{[\s\S]*\}/)
     if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
@@ -352,7 +357,7 @@ Reglas:
             `Corrige el error. Si el motivo es que la traducción salió en chino/japonés, vuelve a traducirla AHORA al ${TARGET_LANG_NAME} correctamente. ` +
             `Si el motivo es que el JSON estaba truncado/incompleto, responde el JSON COMPLETO y CERRADO con su llave final.`
         }
-        const raw = await callLiteLLM(model, [{ role: 'user', content: system + '\n\nTexto:\n' + cleanText + instruction }], { maxTokens: 8192, temperature: 0.1 })
+        const raw = await callLiteLLM(model, [{ role: 'user', content: system + '\n\nTexto:\n' + cleanText + instruction }], { maxTokens: 8192, temperature: 0.1, reasoningEffort: 'none' })
         const jsonMatch = raw.match(/\{[\s\S]*\}/)
         if (!jsonMatch) throw new Error(`${model} no devolvió JSON válido: ${raw.slice(0, 300)}`)
         const result = JSON.parse(jsonMatch[0])
@@ -463,10 +468,80 @@ Reglas:
   }
 
   /**
+   * Pipeline de UN SOLO PASO con deepseek-v4-flash (que ya soporta visión):
+   * recibe la imagen directamente y hace OCR + furigana + kanjis + traducción.
+   * Reemplaza al pipeline de 2 pasos (runOcr + runDeepSeek) que ya no hace falta.
+   *
+   * El prompt es CORTO y limpio (igual que runDeepSeekText): un prompt largo con
+   * muchas menciones a "chino/hanzi/kanji" confunde a deepseek y dispara la
+   * traducción al chino (verificado con prueba A/B en el knowledge del proyecto).
+   */
+  async function runDeepSeekVision(imageBase64, mimeType) {
+    const resized = await resizeImage(imageBase64, mimeType)
+    const system = `Eres un traductor profesional de japonés a ${TARGET_LANG_NAME}. Recibes la imagen de una página de manga.
+
+Transcribe TODO el texto en orden de lectura (derecha a izquierda, arriba a abajo) y, para cada globo de diálogo o párrafo coherente, añade furigana, traducción y los kanjis difíciles.
+
+Responde SOLO con JSON válido, sin markdown ni comentarios, con esta estructura exacta:
+{
+  "blocks": [
+    {
+      "bbox": [0, 0, 0, 0],
+      "original": "texto japonés original (un párrafo o globo de diálogo)",
+      "furigana": "el mismo texto pero con la lectura en hiragana de cada kanji entre paréntesis, ej: 魔物(まもの)",
+      "translation": "traducción completa, natural y fiel al ${TARGET_LANG_NAME}",
+      "kanji": [
+        { "kanji": "un kanji del texto", "reading": "su lectura en hiragana", "meaning": "su significado en ${TARGET_LANG_NAME}" }
+      ]
+    }
+  ]
+}
+
+Reglas:
+- Divide el texto en bloques lógicos (cada globo de diálogo o párrafo coherente es un bloque).
+- "bbox" déjalo en [0,0,0,0] (no se usa para posicionar, el panel es lateral).
+- "furigana": añade la lectura en hiragana entre paréntesis tras cada kanji, manteniendo el resto igual.
+- "translation": traduce TODO el texto al ${TARGET_LANG_NAME} de forma natural y completa (no un resumen). ${TARGET_LANG_EXTRA} ${TARGET_LANG_BAN}
+- "kanji": lista los kanjis difíciles con su lectura y significado en ${TARGET_LANG_NAME}. Si no hay, array vacío.
+- No inventes texto: usa exactamente el que aparece en la imagen. Si el OCR tiene errores evidentes, corrígelos con criterio.`
+
+    const content = [
+      { type: 'text', text: system },
+      { type: 'image_url', image_url: { url: `data:${resized.mimeType};base64,${resized.base64}` } },
+    ]
+    const raw = await callLiteLLM(llmModel, [{ role: 'user', content }], { maxTokens: 8192, temperature: 0.1, reasoningEffort: 'none' })
+
+    const jsonMatch = raw.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) throw new Error(`${llmModel} no devolvió JSON válido: ${raw.slice(0, 300)}`)
+    const result = JSON.parse(jsonMatch[0])
+
+    // Validar que NINGUNA traducción esté en chino/japonés (red de seguridad)
+    for (const block of (result.blocks || [])) {
+      validateTranslationLang(block)
+    }
+
+    // Escalar los bbox de vuelta a las coordenadas de la imagen original
+    const invX = 1 / (resized.scaleX || 1)
+    const invY = 1 / (resized.scaleY || 1)
+    for (const block of (result.blocks || [])) {
+      if (Array.isArray(block.bbox) && block.bbox.length === 4) {
+        block.bbox = [
+          Math.round(block.bbox[0] * invX),
+          Math.round(block.bbox[1] * invY),
+          Math.round(block.bbox[2] * invX),
+          Math.round(block.bbox[3] * invY),
+        ]
+      }
+    }
+    return result
+  }
+
+  /**
    * Analiza una página completa y devuelve el resultado.
    * `type` selecciona el pipeline:
-   *   - 'fast'   (por defecto): OCR qwen3-omni → estructuración deepseek-v4-flash (2 pasos, rápido)
+   *   - 'fast'   (por defecto): deepseek-v4-flash en UN SOLO paso (OCR + furigana + kanjis + traducción)
    *   - 'quality': qwen3-omni en un solo paso (OCR + furigana + kanjis + traducción)
+   *   - 'legacy' : 2 pasos (OCR qwen3-omni → estructuración deepseek-v4-flash) — solo por compatibilidad
    * Escala los bbox de vuelta a las coordenadas de la imagen original.
    */
   async function analyzePage(imageBase64, mimeType, type = 'fast') {
@@ -477,27 +552,39 @@ Reglas:
       console.log(`[annotations] qwen-only done in ${Date.now() - t1}ms, blocks=${(result.blocks || []).length}`)
       return result
     }
-    const { ocrText, scaleX, scaleY } = await runOcr(imageBase64, mimeType)
-    const t2 = Date.now()
-    console.log(`[annotations] OCR done in ${t2 - t1}ms`)
-    result = await runDeepSeek(ocrText)
-    const t3 = Date.now()
-    console.log(`[annotations] DeepSeek done in ${t3 - t2}ms, blocks=${(result.blocks || []).length}`)
-    if (!result.blocks || result.blocks.length === 0) {
-      console.warn('[annotations] WARNING: deepseek devolvió 0 bloques')
-    }
-
-    const invX = 1 / (scaleX || 1)
-    const invY = 1 / (scaleY || 1)
-    for (const block of (result.blocks || [])) {
-      if (Array.isArray(block.bbox) && block.bbox.length === 4) {
-        block.bbox = [
-          Math.round(block.bbox[0] * invX),
-          Math.round(block.bbox[1] * invY),
-          Math.round(block.bbox[2] * invX),
-          Math.round(block.bbox[3] * invY),
-        ]
+    if (type === 'legacy') {
+      // Pipeline antiguo de 2 pasos (OCR qwen3-omni → estructuración deepseek-v4-flash).
+      // Solo se mantiene por compatibilidad; 'fast' ya no lo usa.
+      const { ocrText, scaleX, scaleY } = await runOcr(imageBase64, mimeType)
+      const t2 = Date.now()
+      console.log(`[annotations] OCR done in ${t2 - t1}ms`)
+      result = await runDeepSeek(ocrText)
+      const t3 = Date.now()
+      console.log(`[annotations] DeepSeek done in ${t3 - t2}ms, blocks=${(result.blocks || []).length}`)
+      if (!result.blocks || result.blocks.length === 0) {
+        console.warn('[annotations] WARNING: deepseek devolvió 0 bloques')
       }
+
+      const invX = 1 / (scaleX || 1)
+      const invY = 1 / (scaleY || 1)
+      for (const block of (result.blocks || [])) {
+        if (Array.isArray(block.bbox) && block.bbox.length === 4) {
+          block.bbox = [
+            Math.round(block.bbox[0] * invX),
+            Math.round(block.bbox[1] * invY),
+            Math.round(block.bbox[2] * invX),
+            Math.round(block.bbox[3] * invY),
+          ]
+        }
+      }
+      return result
+    }
+    // 'fast' (por defecto): deepseek-v4-flash en UN SOLO paso (visión)
+    result = await runDeepSeekVision(imageBase64, mimeType)
+    const t2 = Date.now()
+    console.log(`[annotations] deepseek-vision done in ${t2 - t1}ms, blocks=${(result.blocks || []).length}`)
+    if (!result.blocks || result.blocks.length === 0) {
+      console.warn('[annotations] WARNING: deepseek-vision devolvió 0 bloques')
     }
     return result
   }
@@ -573,8 +660,8 @@ Reglas:
     if (bookId == null || startPage == null || endPage == null) {
       return res.status(400).json({ error: 'Missing bookId/startPage/endPage' })
     }
-    if (type !== 'fast' && type !== 'quality') {
-      return res.status(400).json({ error: 'type must be "fast" or "quality"' })
+    if (type !== 'fast' && type !== 'quality' && type !== 'legacy') {
+      return res.status(400).json({ error: 'type must be "fast", "quality" or "legacy"' })
     }
     if (endPage < startPage) {
       return res.status(400).json({ error: 'endPage must be >= startPage' })
@@ -675,7 +762,7 @@ Reglas:
     if (bookId == null || pageNumber == null) {
       return res.status(400).json({ error: 'Missing "bookId" or "pageNumber" in body' })
     }
-    const pipelineType = type === 'quality' ? 'quality' : 'fast'
+    const pipelineType = type === 'quality' ? 'quality' : (type === 'legacy' ? 'legacy' : 'fast')
     try {
       const { result } = await getOrAnalyze(bookId, pageNumber, image, mimeType, pipelineType)
       res.json(result)

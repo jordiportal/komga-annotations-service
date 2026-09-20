@@ -6,10 +6,10 @@ services:
     image: komga-annotations-service:latest
     container_name: komga-annotations
     environment:
-      - LITELLM_URL=https://ollama.khlloreda.com
+      - LITELLM_URL=https://litellm.khlloreda.com
       - LITELLM_API_KEY=${LITELLM_API_KEY}
-      - OCR_MODEL=qwen3-omni
       - LLM_MODEL=deepseek-v4-flash
+      - OCR_MODEL=qwen3-omni
       - PORT=8787
     ports:
       - 8787:8787
