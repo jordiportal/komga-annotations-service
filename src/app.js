@@ -208,27 +208,42 @@ export function createApp(opts = {}) {
   const callLiteLLM = injectedCallLiteLLM || defaultCallLiteLLM
 
   /**
-   * Redimensiona la imagen base64 a un tamaño manejable para el OCR.
+   * Redimensiona y comprime la imagen base64 a un tamaño manejable para el OCR/traducción.
+   * Limita la carga al LLM: resolución moderada (maxDim) + compresión WebP (quality).
+   *
+   * Usa WebP en lugar de JPEG porque el line art de manga (colores planos, bordes
+   * nítidos) comprime MUCHO mejor en WebP que en JPEG (verificado: un PNG de 37KB
+   * pasa a 116KB en JPEG q85 pero a 66KB en WebP q80; en fotos WebP es ~3x más
+   * pequeño). DeepSeek v4 Flash (vía LiteLLM) acepta WebP como image_url.
+   *
    * Devuelve { base64, mimeType, width, height, scaleX, scaleY }.
+   *
+   * Configurable por env:
+   *   - IMAGE_MAX_DIM  (px, lado mayor, por defecto 1000)
+   *   - IMAGE_QUALITY  (0-100, por defecto 80)
    */
   async function resizeImage(imageBase64, mimeType) {
+    const maxDim = Number(process.env.IMAGE_MAX_DIM || 1000)
+    const quality = Number(process.env.IMAGE_QUALITY || 80)
     try {
       // Carga dinámica de sharp: si el binario nativo no está disponible,
-      // devolvemos la imagen sin redimensionar (el OCR funciona igual).
+      // devolvemos la imagen SIN redimensionar. Esto es un riesgo (se envía la
+      // imagen original al LLM), así que lo logueamos para poder detectarlo.
       let sharp
       try {
         sharp = (await import('sharp')).default
       } catch {
+        console.warn(`[annotations] WARNING: sharp no disponible, se envía la imagen ORIGINAL sin comprimir (mime=${mimeType || 'image/png'})`)
         return { base64: imageBase64, mimeType: mimeType || 'image/png', width: 0, height: 0, scaleX: 1, scaleY: 1 }
       }
       const buf = Buffer.from(imageBase64, 'base64')
       const img = sharp(buf)
       const meta = await img.metadata()
-      const maxDim = 1000
       let width = meta.width
       let height = meta.height
       let scaleX = 1
       let scaleY = 1
+      // Solo redimensionar si supera el lado mayor permitido
       if (width > maxDim || height > maxDim) {
         const scale = Math.min(maxDim / width, maxDim / height)
         scaleX = scale
@@ -236,16 +251,21 @@ export function createApp(opts = {}) {
         width = Math.round(width * scale)
         height = Math.round(height * scale)
       }
-      const outBuf = await img.resize(width, height).jpeg({ quality: 85 }).toBuffer()
+      // Comprimir SIEMPRE a WebP (incluso si no se redimensiona): reduce la carga al LLM.
+      const outBuf = await img.resize(width, height).webp({ quality }).toBuffer()
+      const origKB = (buf.length / 1024).toFixed(1)
+      const outKB = (outBuf.length / 1024).toFixed(1)
+      console.log(`[annotations] resizeImage ${meta.width}x${meta.height} -> ${width}x${height} (${origKB}KB -> ${outKB}KB, webp q=${quality})`)
       return {
         base64: outBuf.toString('base64'),
-        mimeType: 'image/jpeg',
+        mimeType: 'image/webp',
         width,
         height,
         scaleX,
         scaleY,
       }
     } catch (e) {
+      console.warn(`[annotations] WARNING: resizeImage falló (${e.message}), se envía la imagen ORIGINAL sin comprimir`)
       return { base64: imageBase64, mimeType: mimeType || 'image/png', width: 0, height: 0, scaleX: 1, scaleY: 1 }
     }
   }
