@@ -216,6 +216,13 @@ export function createApp(opts = {}) {
    * pasa a 116KB en JPEG q85 pero a 66KB en WebP q80; en fotos WebP es ~3x más
    * pequeño). DeepSeek v4 Flash (vía LiteLLM) acepta WebP como image_url.
    *
+   * IMPORTANTE: las páginas normales de manga ya vienen MUY bien comprimidas en
+   * PNG (line art con paleta, ~35KB). Re-encodearlas a RGB+WebP las AGRANDA
+   * (verificado: 37KB -> 66KB). Por eso, tras comprimir, se compara el tamaño del
+   * resultado con el original y se envía SIEMPRE el más pequeño. Así nunca se
+   * manda más carga que la original, pero las imágenes grandes (portadas, páginas
+   * a color) sí se comprimen masivamente (3.4MB -> 67KB).
+   *
    * Devuelve { base64, mimeType, width, height, scaleX, scaleY }.
    *
    * Configurable por env:
@@ -251,18 +258,34 @@ export function createApp(opts = {}) {
         width = Math.round(width * scale)
         height = Math.round(height * scale)
       }
-      // Comprimir SIEMPRE a WebP (incluso si no se redimensiona): reduce la carga al LLM.
+      // Comprimir a WebP (incluso si no se redimensiona).
       const outBuf = await img.resize(width, height).webp({ quality }).toBuffer()
       const origKB = (buf.length / 1024).toFixed(1)
       const outKB = (outBuf.length / 1024).toFixed(1)
-      console.log(`[annotations] resizeImage ${meta.width}x${meta.height} -> ${width}x${height} (${origKB}KB -> ${outKB}KB, webp q=${quality})`)
+
+      // Elegir SIEMPRE el más pequeño entre el original y el comprimido.
+      // Las páginas normales de manga (PNG con paleta) ya están muy comprimidas:
+      // re-encodearlas a WebP las agranda, así que en ese caso se envía el original.
+      if (outBuf.length < buf.length) {
+        console.log(`[annotations] resizeImage ${meta.width}x${meta.height} -> ${width}x${height} (${origKB}KB -> ${outKB}KB, webp q=${quality})`)
+        return {
+          base64: outBuf.toString('base64'),
+          mimeType: 'image/webp',
+          width,
+          height,
+          scaleX,
+          scaleY,
+        }
+      }
+      // El original es más pequeño (o igual): enviarlo tal cual, sin re-encodear.
+      console.log(`[annotations] resizeImage ${meta.width}x${meta.height} -> original más pequeño (${origKB}KB vs ${outKB}KB webp), se envía el original`)
       return {
-        base64: outBuf.toString('base64'),
-        mimeType: 'image/webp',
-        width,
-        height,
-        scaleX,
-        scaleY,
+        base64: imageBase64,
+        mimeType: mimeType || 'image/png',
+        width: meta.width,
+        height: meta.height,
+        scaleX: 1,
+        scaleY: 1,
       }
     } catch (e) {
       console.warn(`[annotations] WARNING: resizeImage falló (${e.message}), se envía la imagen ORIGINAL sin comprimir`)
